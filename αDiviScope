@@ -1,0 +1,150 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import ipywidgets as widgets
+from IPython.display import display, HTML
+from google.colab import files
+from openpyxl import load_workbook
+from openpyxl.drawing.image import Image
+import os
+import random
+
+display(HTML("""
+<h1 style="text-align:center;">αDiviScope</h1>
+<h3 style="text-align:center;">
+A Dedicated Alpha Diversity Quantification & Visualization Tool
+</h3>
+<p style="text-align:center;">
+Upload a taxon table (Excel or CSV) with taxonomic columns followed by sample read counts.
+</p>
+<hr>
+"""))
+
+print("📂 Upload your taxon table (Excel or CSV):")
+uploaded = files.upload()
+filename = list(uploaded.keys())[0]
+
+df = pd.read_csv(filename) if filename.endswith(".csv") else pd.read_excel(filename)
+display(df)
+
+taxonomy_columns = ["Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"]
+sample_columns = [c for c in df.columns if c not in taxonomy_columns]
+df[sample_columns] = df[sample_columns].apply(pd.to_numeric, errors="coerce").fillna(0)
+
+def shannon(c):
+    c = c[c > 0]; p = c / c.sum()
+    return -(p * np.log(p)).sum()
+
+def simpson(c):
+    c = c[c > 0]; p = c / c.sum()
+    return 1 - np.sum(p**2)
+
+def inv_simpson(c):
+    c = c[c > 0]; p = c / c.sum()
+    return 1 / np.sum(p**2)
+
+def observed(c):
+    return (c > 0).sum()
+
+def chao1(c):
+    s_obs = observed(c)
+    f1 = (c == 1).sum()
+    f2 = (c == 2).sum()
+    return s_obs if f2 == 0 else s_obs + (f1*f1)/(2*f2)
+
+def pielou(c):
+    s = observed(c)
+    return shannon(c)/np.log(s) if s > 1 else 0
+
+def berger_parker(c):
+    return c.max() / c.sum()
+
+def goods_coverage(c):
+    return 1 - ((c == 1).sum() / c.sum())
+
+metrics = {
+    "Shannon entropy": shannon,
+    "Simpson index": simpson,
+    "Inverse Simpson": inv_simpson,
+    "Observed taxa (richness)": observed,
+    "Chao1 estimator": chao1,
+    "Pielou evenness": pielou,
+    "Berger–Parker dominance": berger_parker,
+    "Good’s coverage": goods_coverage
+}
+
+def bootstrap_ci(counts, func, n=500):
+    vals = []
+    probs = counts / counts.sum()
+    taxa = counts.index
+    for _ in range(n):
+        resample = np.random.choice(taxa, size=len(taxa), replace=True, p=probs)
+        vals.append(func(counts.loc[resample]))
+    return np.percentile(vals, [2.5, 97.5])
+
+metric_selector = widgets.Dropdown(
+    options=list(metrics.keys()),
+    description="Alpha metric:",
+    style={"description_width": "initial"}
+)
+
+output = widgets.Output()
+plots = {}
+tables = {}
+
+def calculate_metric(metric):
+    output.clear_output()
+    func = metrics[metric]
+
+    rows = []
+    for s in sample_columns:
+        val = func(df[s])
+        ci_low, ci_high = bootstrap_ci(df[s], func)
+        rows.append([s, val, ci_low, ci_high])
+
+    metric_df = pd.DataFrame(
+        rows, columns=["Sample", metric, "CI_lower", "CI_upper"]
+    )
+
+    tables[metric] = metric_df
+
+    with output:
+        display(metric_df)
+
+        plt.figure(figsize=(6,4))
+        plt.bar(metric_df["Sample"], metric_df[metric])
+        plt.title(metric)
+        plt.ylabel(metric)
+        plt.xlabel("Sample")
+        plt.tight_layout()
+
+        plot_file = f"{metric}.png"
+        plt.savefig(plot_file, dpi=150)
+        plt.show()
+        plt.close()
+
+        plots[metric] = plot_file
+
+widgets.interactive(calculate_metric, metric=metric_selector)
+display(metric_selector)
+display(output)
+
+def export_results():
+    metric = metric_selector.value
+    excel_name = f"αDiviScope_{metric.replace(' ','_')}.xlsx"
+
+    with pd.ExcelWriter(excel_name, engine="openpyxl") as writer:
+        tables[metric].to_excel(writer, sheet_name=metric[:31], index=False)
+
+    wb = load_workbook(excel_name)
+    ws = wb[metric[:31]]
+    img = Image(plots[metric])
+    img.anchor = "E2"
+    ws.add_image(img)
+
+    wb.save(excel_name)
+    files.download(excel_name)
+
+export_button = widgets.Button(description="⬇ Download Visible Metric")
+export_button.on_click(lambda x: export_results())
+display(export_button)
